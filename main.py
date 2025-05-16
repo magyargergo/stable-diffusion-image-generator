@@ -36,11 +36,6 @@ from diffusers import (
     DPMSolverMultistepScheduler
 )
 from compel import Compel
-try:
-    from compel.stable_diffusion_xl import CompelXL
-except ImportError:
-    # For older compel versions that don't support SDXL
-    CompelXL = None
 
 # -----------------------------------------------------------------------------
 # Constants — tweak here
@@ -57,21 +52,18 @@ DEFAULT_NUM_IMAGES = 1           # number of images to generate
 OUTPUT_DIR = Path("outputs")
 
 DEFAULT_PROMPT = (
-    "A vast, subterranean cathedral lost to myth — carved from obsidian and bone, "
-    "drowned in perpetual night. No daylight intrudes; only the baleful crimson "
-    "glow of a jagged Worldstone levitates over a spiked black dais, lava‑veined "
-    "facets imprisoned inside a crackling sphere of eldritch energy. Four titanic "
-    "iron chains, thick as trees, groan as they tether the sphere to the earth. "
-    "Colossal statues flank the relic: on the left, Inarius the fallen angel, face "
-    "shrouded by a martyr's hood, ghost‑fire wings spread behind baroque plate; on "
-    "the right, Lilith, Queen of Hatred, crowned by sweeping ram‑horns, draped in "
-    "shadow‑soaked silks, stone eyes smouldering ember‑red. Runes scar every column; "
-    "braziers sputter sickly orange flames that paint restless shadows across ash‑thick "
-    "air. Camera: ultra‑wide 32:9, low‑angle hero shot with dramatic perspective, "
-    "anamorphic lens flares and subtle film grain. Lighting: cinematic chiaroscuro — "
-    "deep blacks, pools of molten red, volumetric fog and drifting embers caught in "
-    "shafts of infernal light. Style: grimdark high‑fantasy cinematic concept art, "
-    "hyper‑detailed, 8k, Octane render, high dynamic range."
+    "Ultra-detailed dark-fantasy concept art, Diablo II Act V aesthetic, photorealistic 4K resolution, 3:2 —  "
+    "vast subterranean cathedral carved from black basalt, Gothic arches vanishing into darkness;  "
+    "colossal BLOOD-RED WORLDSTONE shard dominates the foreground, jagged surface ablaze with magma-like fissures, "
+    "suspended above a tiered, rune-etched stone dais;  "
+    "demon-forged iron cradle encircling mid-section, massive CHAINS anchoring to platform;  "
+    "transparent spherical ENERGY BARRIER surrounds the shard, crimson lightning veining across its surface;  "
+    "half-shrouded in gloom, two monumental weather-worn granite statues guard the relic:  "
+    "INARIUS on the left — hooded, faceless angel in flared plate armor with staff, broad feathered wings spread behind him;  "
+    "LILITH on the right — elegant demoness with twin crown-horns, serene yet sinister visage, fitted cuirass, folded bat-wings;  "
+    "rune-adorned bridges and stairs, ember-littered floor, dust motes swirling in angled shafts of light;  "
+    "foreboding cinematic lighting, rich shadow interplay, volumetric haze, intricate textures on stone, metal, crystal;  "
+    "epic, grim, high contrast, Octane render"
 )
 
 NEGATIVE_PROMPT = (
@@ -116,7 +108,6 @@ def load_pipeline(use_xl: bool = False) -> Union[
         if hasattr(pipe, 'enable_xformers_memory_efficient_attention'):
             pipe.enable_xformers_memory_efficient_attention()
         
-        # No CompelXL, just return None as the compel processor
         return pipe, None
     else:
         print(f"Loading SD model: {SD_MODEL_ID}")
@@ -145,6 +136,207 @@ def save_images(images: List["PIL.Image.Image"], seed: int, use_xl: bool) -> Lis
         img.save(path)
         paths.append(path)
     return paths
+
+def chunk_and_process_prompt(prompt, max_length=75):
+    """Break a long prompt into chunks that fit within token limits and process sequentially."""
+    words = prompt.split()
+    chunks = []
+    current_chunk = []
+    current_length = 0
+    
+    for word in words:
+        # Roughly estimate token count (this is approximate)
+        word_length = len(word.split()) 
+        
+        if current_length + word_length > max_length:
+            # This chunk is full, save it and start a new one
+            chunks.append(" ".join(current_chunk))
+            current_chunk = [word]
+            current_length = word_length
+        else:
+            # Add word to current chunk
+            current_chunk.append(word)
+            current_length += word_length
+    
+    # Add the last chunk if it's not empty
+    if current_chunk:
+        chunks.append(" ".join(current_chunk))
+    
+    return chunks
+
+def process_chunked_prompt(pipe, prompt, max_length=75):
+    """Process a long prompt by breaking it into chunks and keeping the most important parts."""
+    # If the prompt is short enough, just return it as is
+    if len(prompt.split()) <= max_length:
+        return prompt
+    
+    # Split into chunks
+    chunks = chunk_and_process_prompt(prompt, max_length)
+    print(f"Prompt was split into {len(chunks)} chunks")
+    
+    # For simplicity, if we have multiple chunks, keep:
+    # 1. The first chunk (usually contains the main subject)
+    # 2. Key style words from the last chunk (usually contains style directions)
+    
+    # Extract style keywords from the last chunk
+    style_chunk = chunks[-1]
+    style_keywords = []
+    
+    # Common style-related keywords
+    style_markers = ["style", "render", "detailed", "art", "quality", "lighting", "resolution", 
+                    "cinematic", "dynamic", "range", "aesthetic", "perspective", "mood", "tone"]
+    
+    # Extract style-related phrases
+    for marker in style_markers:
+        if marker in style_chunk.lower():
+            # Find the phrase containing this marker
+            words = style_chunk.split()
+            for i, word in enumerate(words):
+                if marker.lower() in word.lower():
+                    # Take a few words before and after as context
+                    start = max(0, i-3)
+                    end = min(len(words), i+4)
+                    style_keywords.append(" ".join(words[start:end]))
+    
+    # Combine first chunk with style keywords
+    processed_prompt = chunks[0]
+    if style_keywords:
+        processed_prompt += ", " + ", ".join(style_keywords)
+    
+    print(f"Original prompt length: {len(prompt.split())} words")
+    print(f"Processed prompt length: {len(processed_prompt.split())} words")
+    return processed_prompt
+
+def encode_prompt_properly(pipe, prompt, negative_prompt=None):
+    """Create proper embeddings for SDXL without truncating the prompt"""
+    # Get tokenizers and text encoders
+    tokenizer_1 = pipe.tokenizer
+    tokenizer_2 = pipe.tokenizer_2
+    text_encoder_1 = pipe.text_encoder
+    text_encoder_2 = pipe.text_encoder_2
+    
+    # Process prompt in segments to handle very long prompts
+    max_length = tokenizer_1.model_max_length
+    words = prompt.split()
+    segments = []
+    current_segment = []
+    current_length = 0
+    
+    # Roughly estimate token counts and segment the prompt
+    for word in words:
+        # Crude token estimation
+        word_tokens = len(tokenizer_1.tokenize(word))
+        if current_length + word_tokens > max_length - 2:  # -2 for special tokens
+            segments.append(" ".join(current_segment))
+            current_segment = [word]
+            current_length = word_tokens
+        else:
+            current_segment.append(word)
+            current_length += word_tokens
+    
+    if current_segment:
+        segments.append(" ".join(current_segment))
+    
+    print(f"Split prompt into {len(segments)} segments")
+    
+    # Process each segment
+    device = text_encoder_1.device
+    prompt_embeds_list_1 = []
+    prompt_embeds_list_2 = []
+    pooled_embeds_list = []
+    
+    for segment in segments:
+        # Process through first text encoder
+        text_inputs_1 = tokenizer_1(
+            segment,
+            padding="max_length",
+            max_length=tokenizer_1.model_max_length,
+            truncation=True,
+            return_tensors="pt",
+        ).to(device)
+        
+        # Process through second text encoder
+        text_inputs_2 = tokenizer_2(
+            segment,
+            padding="max_length",
+            max_length=tokenizer_2.model_max_length,
+            truncation=True,
+            return_tensors="pt",
+        ).to(device)
+        
+        with torch.no_grad():
+            # Get embeddings from first text encoder (hidden_states)
+            prompt_embeds_1 = text_encoder_1(
+                text_inputs_1.input_ids,
+                attention_mask=text_inputs_1.attention_mask,
+            )[0]
+            
+            # Get embeddings from second text encoder (hidden_states and pooled output)
+            text_encoder_2_output = text_encoder_2(
+                text_inputs_2.input_ids,
+                attention_mask=text_inputs_2.attention_mask,
+            )
+            prompt_embeds_2 = text_encoder_2_output[0]
+            pooled_embeds = text_encoder_2_output[1]
+            
+            # Collect embeddings
+            prompt_embeds_list_1.append(prompt_embeds_1)
+            prompt_embeds_list_2.append(prompt_embeds_2)
+            pooled_embeds_list.append(pooled_embeds)
+    
+    # Combine segments (average the embeddings)
+    if len(segments) > 1:
+        prompt_embeds_1 = torch.stack(prompt_embeds_list_1).mean(dim=0)
+        prompt_embeds_2 = torch.stack(prompt_embeds_list_2).mean(dim=0)
+        pooled_prompt_embeds = torch.stack(pooled_embeds_list).mean(dim=0)
+    else:
+        prompt_embeds_1 = prompt_embeds_list_1[0]
+        prompt_embeds_2 = prompt_embeds_list_2[0]
+        pooled_prompt_embeds = pooled_embeds_list[0]
+    
+    # Process negative prompt
+    if negative_prompt:
+        neg_text_inputs_1 = tokenizer_1(
+            negative_prompt,
+            padding="max_length",
+            max_length=tokenizer_1.model_max_length,
+            truncation=True,
+            return_tensors="pt",
+        ).to(device)
+        
+        neg_text_inputs_2 = tokenizer_2(
+            negative_prompt,
+            padding="max_length",
+            max_length=tokenizer_2.model_max_length,
+            truncation=True,
+            return_tensors="pt",
+        ).to(device)
+        
+        with torch.no_grad():
+            # Get hidden states
+            neg_prompt_embeds_1 = text_encoder_1(
+                neg_text_inputs_1.input_ids,
+                attention_mask=neg_text_inputs_1.attention_mask,
+            )[0]
+            
+            # Get hidden states and pooled output
+            neg_text_encoder_2_output = text_encoder_2(
+                neg_text_inputs_2.input_ids,
+                attention_mask=neg_text_inputs_2.attention_mask,
+            )
+            neg_prompt_embeds_2 = neg_text_encoder_2_output[0]
+            neg_pooled_prompt_embeds = neg_text_encoder_2_output[1]
+    else:
+        # Create empty tensors for negative prompt
+        neg_prompt_embeds_1 = torch.zeros_like(prompt_embeds_1)
+        neg_prompt_embeds_2 = torch.zeros_like(prompt_embeds_2)
+        neg_pooled_prompt_embeds = torch.zeros_like(pooled_prompt_embeds)
+    
+    # Concatenate embeddings from both text encoders
+    prompt_embeds = torch.cat([prompt_embeds_1, prompt_embeds_2], dim=-1)
+    negative_prompt_embeds = torch.cat([neg_prompt_embeds_1, neg_prompt_embeds_2], dim=-1)
+    
+    return prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, neg_pooled_prompt_embeds
 
 # -----------------------------------------------------------------------------
 # Main routine with command-line arguments
@@ -176,18 +368,56 @@ def main():
 
     print("Encoding long prompt with Compel (avoids token truncation)…")
     if use_xl:
-        # For SDXL, we'll use the pipeline directly without Compel
-        print("Generating image(s)… ☕")
-        result = pipe(
-            prompt=DEFAULT_PROMPT,
-            negative_prompt=NEGATIVE_PROMPT,
-            width=width,
-            height=height,
-            num_images_per_prompt=args.count,
-            num_inference_steps=args.steps,
-            guidance_scale=args.cfg,
-            generator=generator,
-        )
+        # For SDXL, use our custom embedding approach
+        print("Using custom embedding for SDXL to handle long prompts...")
+        try:
+            # Use proper embedding with segmentation
+            prompt_embeds, negative_embeds, pooled_prompt_embeds, pooled_negative_embeds = encode_prompt_properly(
+                pipe, DEFAULT_PROMPT, NEGATIVE_PROMPT
+            )
+            
+            print("Generating image(s) with full embedded prompt... ☕")
+            result = pipe(
+                prompt_embeds=prompt_embeds,
+                negative_prompt_embeds=negative_embeds,
+                pooled_prompt_embeds=pooled_prompt_embeds,
+                pooled_negative_prompt_embeds=pooled_negative_embeds,
+                width=width,
+                height=height,
+                num_images_per_prompt=args.count,
+                num_inference_steps=args.steps,
+                guidance_scale=args.cfg,
+                generator=generator,
+            )
+        except Exception as e:
+            print(f"Error with custom embedding: {e}")
+            print("Falling back to chunked prompt processing")
+            try:
+                processed_prompt = process_chunked_prompt(pipe, DEFAULT_PROMPT)
+                print("Generating image(s) with processed prompt... ☕")
+                result = pipe(
+                    prompt=processed_prompt,
+                    negative_prompt=NEGATIVE_PROMPT,
+                    width=width,
+                    height=height,
+                    num_images_per_prompt=args.count,
+                    num_inference_steps=args.steps,
+                    guidance_scale=args.cfg,
+                    generator=generator,
+                )
+            except Exception as e2:
+                print(f"Error with chunked prompt: {e2}")
+                print("Falling back to direct prompt input (will truncate)")
+                result = pipe(
+                    prompt=DEFAULT_PROMPT,
+                    negative_prompt=NEGATIVE_PROMPT,
+                    width=width,
+                    height=height,
+                    num_images_per_prompt=args.count,
+                    num_inference_steps=args.steps,
+                    guidance_scale=args.cfg,
+                    generator=generator,
+                )
     else:
         # Regular SD prompt handling
         prompt_embeds = compel_proc(DEFAULT_PROMPT)
