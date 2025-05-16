@@ -22,7 +22,7 @@ A Python script that generates fantasy-themed underground vault scenes using Sta
 
 1. Clone this repository:
    ```
-   git clone https://github.com/yourusername/stable-diffusion-image-generator.git
+   git clone https://github.com/magyargergo/stable-diffusion-image-generator.git
    cd stable-diffusion-image-generator
    ```
 
