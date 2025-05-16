@@ -64,4 +64,4 @@ You can customize the generation by editing the constants at the top of `main.py
 
 ## License
 
-MIT 
+MIT
